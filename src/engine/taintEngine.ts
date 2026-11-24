@@ -1,59 +1,62 @@
-import type { IRNode, WorkflowIR } from '../types/workflowIR';
+import type { AnalysisStatus, IRNode, WorkflowIR } from '../types/workflowIR';
 
 export const ENGINE_LIMITS = {
   MAX_FINDINGS: 200,
   MAX_BFS_VISITS: 5_000,
 } as const;
 
-export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+export type Severity = 'HIGH' | 'MEDIUM' | 'LOW';
 
 export type RuleId =
-  | 'LETHAL_TRIFECTA'
-  | 'SHADOW_AI_NATIVE_BYPASS'
-  | 'SHADOW_AI_DIRECT_HTTP'
-  | 'TAINTED_DYNAMIC_URL';
+  | 'CANDIDATE_TRIFECTA_CHAIN'
+  | 'NATIVE_LLM_CONNECTOR_OBSERVED'
+  | 'DIRECT_PROVIDER_ENDPOINT_DECLARED'
+  | 'TAINTED_DYNAMIC_HOST';
 
-export type FindingConfidence = 'confirmed' | 'potential';
+export type EvidenceBasis = 'explicit_mapping' | 'control_flow_only' | 'static_config';
 
 export interface SecurityFinding {
   id: string;
   ruleId: RuleId;
   severity: Severity;
-  confidence: FindingConfidence;
+  evidenceBasis: EvidenceBasis;
   title: string;
   description: string;
   remediation: string;
-  /** Ordered list of node IDs showing the attack / taint path */
+  /** Ordered list of node IDs showing the observed graph path */
   pathNodeIds: string[];
   /** Human-readable node labels matching pathNodeIds */
   pathLabels: string[];
   /** Primary node IDs implicated in this finding */
   implicatedNodeIds: string[];
-  /** True if the LLM in a trifecta path is routed through an allowlisted AI Gateway */
-  mitigatedByGateway?: boolean;
+  /** True if the LLM node's hostname matched an allowlisted AI Gateway (policy enforcement unverified statically) */
+  gatewayEndpointMatched?: boolean;
 }
 
-export type RiskVerdict = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'CLEAN';
+export type ScanVerdict =
+  | 'REVIEW_REQUIRED'
+  | 'NO_CANDIDATES_FOUND'
+  | 'INCOMPLETE_ANALYSIS';
 
 export interface ScanSummary {
+  analysisStatus: AnalysisStatus;
+  verdict: ScanVerdict;
   totalNodes: number;
   untrustedSourceCount: number;
   llmNodeCount: number;
   outboundSinkCount: number;
-  gatewayRoutedCount: number;
-  gatewayBypassCount: number;
-  criticalCount: number;
+  gatewayHostMatchedCount: number;
+  directOrNativeLlmCount: number;
   highCount: number;
   mediumCount: number;
   lowCount: number;
-  riskScore: number;
-  verdict: RiskVerdict;
   truncatedFindings: boolean;
 }
 
 export interface ScanReport {
   workflowName: string;
   platform: WorkflowIR['platform'];
+  analysisStatus: AnalysisStatus;
   scannedAtIso: string;
   findings: SecurityFinding[];
   summary: ScanSummary;
@@ -61,10 +64,9 @@ export interface ScanReport {
 }
 
 const SEVERITY_ORDER: Record<Severity, number> = {
-  CRITICAL: 0,
-  HIGH: 1,
-  MEDIUM: 2,
-  LOW: 3,
+  HIGH: 0,
+  MEDIUM: 1,
+  LOW: 2,
 };
 
 function hasNode(ir: WorkflowIR, id: string): boolean {
@@ -142,33 +144,9 @@ function labelsForPath(ir: WorkflowIR, ids: string[]): string[] {
   return ids.map((id) => (hasNode(ir, id) ? ir.nodes[id].label : `#${id}`));
 }
 
-function computeRiskScore(findings: SecurityFinding[]): {
-  score: number;
-  verdict: RiskVerdict;
-} {
-  let score = 0;
-  for (const f of findings) {
-    if (f.severity === 'CRITICAL') score += 45;
-    else if (f.severity === 'HIGH') score += 25;
-    else if (f.severity === 'MEDIUM') score += 12;
-    else score += 5;
-  }
-  const capped = Math.min(100, score);
-
-  if (findings.some((f) => f.severity === 'CRITICAL')) {
-    return { score: Math.max(capped, 85), verdict: 'CRITICAL' };
-  }
-  if (findings.some((f) => f.severity === 'HIGH')) {
-    return { score: Math.max(capped, 60), verdict: 'HIGH' };
-  }
-  if (findings.some((f) => f.severity === 'MEDIUM')) {
-    return { score: Math.max(capped, 30), verdict: 'MEDIUM' };
-  }
-  return { score: capped, verdict: 'CLEAN' };
-}
-
 export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
   const allNodes: IRNode[] = Object.values(ir.nodes);
+  const analysisStatus: AnalysisStatus = ir.analysisStatus ?? 'COMPLETE';
 
   const sources = allNodes.filter((n) => n.roles.includes('untrusted_source'));
   const llms = allNodes.filter((n) => n.roles.includes('llm_processor'));
@@ -189,7 +167,7 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     return true;
   };
 
-  // Rule 1: LETHAL TRIFECTA (Untrusted Source -> LLM Processor -> Outbound Sink)
+  // Rule 1: CANDIDATE TRIFECTA CHAIN (Input Source -> LLM Processor -> Outbound Sink)
   trifectaLoop: for (const source of sources) {
     for (const llm of llms) {
       if (source.id === llm.id) continue;
@@ -205,27 +183,27 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
         const llmToSinkAny = llmToSinkData ?? findShortestPath(combinedAdj, llm.id, sink.id);
         if (!llmToSinkAny) continue;
 
-        const isConfirmedDataFlow = Boolean(srcToLlmData && llmToSinkData);
+        const hasExplicitMapping = Boolean(srcToLlmData && llmToSinkData);
         const pathNodeIds = [...srcToLlmAny, ...llmToSinkAny.slice(1)];
-        const isGatewayRouted = llm.ai.gatewayStatus === 'gateway_routed';
+        const gatewayEndpointMatched = llm.ai.gatewayStatus === 'gateway_routed';
 
         const ok = pushFinding({
-          id: `TRIFECTA-${source.id}-${llm.id}-${sink.id}`,
-          ruleId: 'LETHAL_TRIFECTA',
-          severity: isConfirmedDataFlow ? 'CRITICAL' : 'HIGH',
-          confidence: isConfirmedDataFlow ? 'confirmed' : 'potential',
-          title: isConfirmedDataFlow
-            ? 'Confirmed Lethal Trifecta: Indirect Prompt Injection to Exfiltration'
-            : 'Potential Lethal Trifecta: Untrusted Input Reaches LLM & Outbound Egress',
-          description: isConfirmedDataFlow
-            ? `Explicit data flow traces untrusted input from ${source.label} into LLM node ${llm.label}, whose output flows directly into outbound sink ${sink.label}. An attacker can inject instructions into the input payload to hijack the LLM and exfiltrate sensitive context.`
-            : `Control-flow execution reaches LLM node ${llm.label} from untrusted source ${source.label} and continues to outbound sink ${sink.label}. Verify whether untrusted data enters the prompt or LLM output triggers this egress action.`,
+          id: `CHAIN-${source.id}-${llm.id}-${sink.id}`,
+          ruleId: 'CANDIDATE_TRIFECTA_CHAIN',
+          severity: hasExplicitMapping ? 'HIGH' : 'MEDIUM',
+          evidenceBasis: hasExplicitMapping ? 'explicit_mapping' : 'control_flow_only',
+          title: hasExplicitMapping
+            ? 'Explicit Mapping Chain Observed: Input → LLM → Outbound Sink'
+            : 'Candidate Control-Flow Path: Input → LLM → Outbound Sink',
+          description: hasExplicitMapping
+            ? `Explicit IML mapping references connect ${source.label} into LLM node ${llm.label} and from ${llm.label} into outbound sink ${sink.label}. Static analysis cannot verify whether private data is present in context or whether runtime filters block abuse; manual review is required.`
+            : `Control-flow execution reaches ${llm.label} from ${source.label} and continues to outbound sink ${sink.label} without an explicit IML reference on both legs. Verify whether untrusted input enters the prompt or LLM output triggers this egress action.`,
           remediation:
-            'Break the trifecta: (1) Enforce strict JSON schema validation / allowlisted enum outputs after the LLM, (2) require human-in-the-loop approval before outbound egress, and (3) route LLM traffic through a corporate AI Gateway with prompt-injection & DLP inspection.',
+            'Review data sensitivity and trust boundaries: (1) enforce strict JSON schema / allowlisted enum validation after the LLM, (2) require human approval before sensitive outbound actions, and (3) verify whether prompt-injection and DLP controls are enforced upstream.',
           pathNodeIds,
           pathLabels: labelsForPath(ir, pathNodeIds),
           implicatedNodeIds: [source.id, llm.id, sink.id],
-          mitigatedByGateway: isGatewayRouted,
+          gatewayEndpointMatched,
         });
 
         if (!ok) break trifectaLoop;
@@ -233,18 +211,18 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     }
   }
 
-  // Rule 2 & 3: SHADOW AI / CORPORATE AI GATEWAY BYPASS
+  // Rule 2 & 3: AI GATEWAY GOVERNANCE EVIDENCE
   for (const llm of llms) {
     if (llm.ai.gatewayStatus === 'native_bypass') {
       const ok = pushFinding({
-        id: `SHADOW-NATIVE-${llm.id}`,
-        ruleId: 'SHADOW_AI_NATIVE_BYPASS',
-        severity: 'HIGH',
-        confidence: 'confirmed',
-        title: `Native LLM Connector Bypasses Corporate AI Gateway (${llm.ai.provider ?? 'unknown'})`,
-        description: `Module ${llm.label} uses a native vendor integration (${llm.rawType}), which hardcodes direct API calls to the model provider and bypasses enterprise AI Gateways, DLP policies, token budgets, and centralized audit logs.`,
+        id: `NATIVE-LLM-${llm.id}`,
+        ruleId: 'NATIVE_LLM_CONNECTOR_OBSERVED',
+        severity: 'MEDIUM',
+        evidenceBasis: 'static_config',
+        title: `Native LLM Connector Observed (${llm.ai.provider ?? 'unknown'})`,
+        description: `Module ${llm.label} is configured with a native vendor connector (${llm.rawType}). Native connectors typically send traffic directly to the vendor API rather than a custom corporate AI Gateway hostname; verify external network or governance controls.`,
         remediation:
-          'Replace the native LLM module with an HTTP Request module pointed at your corporate AI Gateway (e.g., Cloudflare AI Gateway, Portkey, LiteLLM, or Palo Alto Prisma AIRS) using gateway-issued virtual keys.',
+          'If your organization mandates centralized AI Gateway routing, replace the native connector with an HTTP module targeting your allowlisted gateway hostname using gateway-managed credentials.',
         pathNodeIds: [llm.id],
         pathLabels: [llm.label],
         implicatedNodeIds: [llm.id],
@@ -252,14 +230,14 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
       if (!ok) break;
     } else if (llm.ai.gatewayStatus === 'direct_http_bypass') {
       const ok = pushFinding({
-        id: `SHADOW-HTTP-${llm.id}`,
-        ruleId: 'SHADOW_AI_DIRECT_HTTP',
+        id: `DIRECT-LLM-${llm.id}`,
+        ruleId: 'DIRECT_PROVIDER_ENDPOINT_DECLARED',
         severity: 'MEDIUM',
-        confidence: 'confirmed',
-        title: `Direct HTTP Call to Vendor LLM API (${llm.ai.provider ?? 'unknown'})`,
-        description: `Module ${llm.label} calls ${llm.ai.targetUrl ?? 'a vendor LLM endpoint'} directly over HTTP instead of routing through an allowlisted AI Gateway, leaving prompt payloads invisible to security monitoring.`,
+        evidenceBasis: 'static_config',
+        title: `Direct Provider LLM Endpoint Declared (${llm.ai.provider ?? 'unknown'})`,
+        description: `Module ${llm.label} declares ${llm.ai.targetUrl ?? 'a vendor LLM endpoint'} over HTTP rather than an allowlisted AI Gateway hostname. Verify whether this bypasses required prompt logging or DLP controls.`,
         remediation:
-          'Update the HTTP target base URL to your approved corporate AI Gateway hostname and rotate the raw vendor API key stored in Make.com.',
+          'Point the HTTP target base URL at your approved corporate AI Gateway hostname and rotate any raw vendor API keys stored in the connection.',
         pathNodeIds: [llm.id],
         pathLabels: [llm.label],
         implicatedNodeIds: [llm.id],
@@ -268,29 +246,43 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     }
   }
 
-  // Rule 4: TAINTED DYNAMIC URL (SSRF / Attacker-Controlled Exfiltration Endpoint)
+  // Rule 4: TAINTED DYNAMIC HOST (Potential SSRF / Destination Host Manipulation)
+  // Only fires when {{...}} appears in the URL scheme, authority, hostname, or port — NOT fixed-host query params.
   const taintOrigins = [...sources, ...llms];
   ssrfLoop: for (const sink of sinks) {
     if (!sink.rawType.toLowerCase().startsWith('http:')) continue;
-    const hasDynamicUrl = Boolean(sink.egressUrl && sink.egressUrl.includes('{{'));
-    if (!hasDynamicUrl) continue;
+    if (!sink.egressUrlHasDynamicHost) continue;
 
+    const urlRefs = sink.urlReferencedNodeIds ?? [];
     for (const origin of taintOrigins) {
       if (origin.id === sink.id) continue;
-      const dataPath = findShortestPath(dataAdj, origin.id, sink.id);
-      if (!dataPath) continue;
+
+      let matchedPath: string[] | null = null;
+      if (urlRefs.includes(origin.id)) {
+        matchedPath = [origin.id, sink.id];
+      } else {
+        for (const urlRefId of urlRefs) {
+          const upstreamPath = findShortestPath(dataAdj, origin.id, urlRefId);
+          if (upstreamPath) {
+            matchedPath = [...upstreamPath, sink.id];
+            break;
+          }
+        }
+      }
+
+      if (!matchedPath) continue;
 
       const ok = pushFinding({
-        id: `DYNAMIC-URL-${origin.id}-${sink.id}`,
-        ruleId: 'TAINTED_DYNAMIC_URL',
+        id: `DYNAMIC-HOST-${origin.id}-${sink.id}`,
+        ruleId: 'TAINTED_DYNAMIC_HOST',
         severity: 'HIGH',
-        confidence: 'confirmed',
-        title: 'SSRF / Dynamic Exfiltration URL Influenced by Untrusted or LLM Data',
-        description: `HTTP module ${sink.label} interpolates dynamic IML expressions into its destination URL (${sink.egressUrl}) and receives tainted data from ${origin.label}. Attackers can redirect requests to internal metadata endpoints or attacker-controlled servers.`,
+        evidenceBasis: 'explicit_mapping',
+        title: 'Potential SSRF: Dynamic Hostname/Authority Influenced by Input or LLM Data',
+        description: `HTTP module ${sink.label} interpolates an IML expression into the destination hostname/authority (${sink.egressUrl ?? '[redacted]'}) with a data-flow path from ${origin.label}. Attacker-influenced hostnames can redirect outbound requests to unintended or internal destinations.`,
         remediation:
-          'Hardcode the destination host and path in the HTTP module, or validate dynamic URL parameters against a strict domain allowlist before executing the request.',
-        pathNodeIds: dataPath,
-        pathLabels: labelsForPath(ir, dataPath),
+          'Hardcode the destination scheme and hostname in the HTTP module, or validate dynamic host values against a strict allowlist before making the request.',
+        pathNodeIds: matchedPath,
+        pathLabels: labelsForPath(ir, matchedPath),
         implicatedNodeIds: [origin.id, sink.id],
       });
 
@@ -299,38 +291,45 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     }
   }
 
-  // Deterministic ordering: CRITICAL -> HIGH -> MEDIUM -> LOW, then by ID
+  // Deterministic ordering: HIGH -> MEDIUM -> LOW, then by ID
   findings.sort((a, b) => {
     const sevDiff = SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
     if (sevDiff !== 0) return sevDiff;
     return a.id.localeCompare(b.id);
   });
 
-  const gatewayRoutedCount = llms.filter((n) => n.ai.gatewayStatus === 'gateway_routed').length;
-  const gatewayBypassCount = llms.filter(
+  const gatewayHostMatchedCount = llms.filter((n) => n.ai.gatewayStatus === 'gateway_routed').length;
+  const directOrNativeLlmCount = llms.filter(
     (n) => n.ai.gatewayStatus === 'native_bypass' || n.ai.gatewayStatus === 'direct_http_bypass'
   ).length;
 
-  const { score, verdict } = computeRiskScore(findings);
+  let verdict: ScanVerdict;
+  if (findings.length > 0) {
+    verdict = 'REVIEW_REQUIRED';
+  } else if (analysisStatus === 'PARTIAL') {
+    verdict = 'INCOMPLETE_ANALYSIS';
+  } else {
+    verdict = 'NO_CANDIDATES_FOUND';
+  }
 
   return {
     workflowName: ir.name,
     platform: ir.platform,
+    analysisStatus,
     scannedAtIso: new Date().toISOString(),
     findings,
     summary: {
+      analysisStatus,
+      verdict,
       totalNodes: allNodes.length,
       untrustedSourceCount: sources.length,
       llmNodeCount: llms.length,
       outboundSinkCount: sinks.length,
-      gatewayRoutedCount,
-      gatewayBypassCount,
-      criticalCount: findings.filter((f) => f.severity === 'CRITICAL').length,
+      gatewayHostMatchedCount,
+      directOrNativeLlmCount,
       highCount: findings.filter((f) => f.severity === 'HIGH').length,
       mediumCount: findings.filter((f) => f.severity === 'MEDIUM').length,
       lowCount: findings.filter((f) => f.severity === 'LOW').length,
-      riskScore: score,
-      verdict,
       truncatedFindings,
     },
     parseWarnings: ir.parseWarnings,

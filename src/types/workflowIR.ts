@@ -1,59 +1,62 @@
-export type Platform = 'make' | 'n8n';
+export type WorkflowPlatform = 'make' | 'n8n' | 'zapier';
 
-export type TaintRole =
+export type AnalysisStatus = 'COMPLETE' | 'PARTIAL';
+
+export type NodeSecurityRole =
   | 'untrusted_source'
   | 'llm_processor'
   | 'outbound_sink'
   | 'router'
-  | 'transform'
-  | 'unknown';
+  | 'transform';
 
 export type AIGatewayStatus =
   | 'none'
-  | 'native_bypass'       // Native vendor connector (e.g., openai-gpt-3:*) cannot route via corp AI Gateway
-  | 'direct_http_bypass'  // Raw HTTP request hitting vendor LLM API directly
-  | 'gateway_routed';     // HTTP request routed through a recognized/allowlisted AI Gateway
+  | 'native_bypass'
+  | 'direct_http_bypass'
+  | 'gateway_routed';
 
-export interface AIMetadata {
+export interface AINodeMetadata {
   isLLM: boolean;
   provider?: string;
+  model?: string;
   gatewayStatus: AIGatewayStatus;
+  /** Redacted target URL (credentials, query values, and fragments stripped) */
   targetUrl?: string;
 }
 
 export interface IRNode {
   id: string;
-  platform: Platform;
-  /** Raw module identifier, e.g., "openai-gpt-3:CreateCompletion" */
+  platform: WorkflowPlatform;
   rawType: string;
-  /** Human-readable display label (sanitized plain text only) */
   label: string;
-  /** Security roles assigned to this node */
-  roles: TaintRole[];
-  ai: AIMetadata;
-  /** Validated http(s) URL if statically extractable */
+  roles: NodeSecurityRole[];
+  ai: AINodeMetadata;
+  /** Redacted outbound URL if this node is an HTTP/webhook sink */
   egressUrl?: string;
-  /** Upstream node IDs explicitly referenced via expressions (e.g., Make IML {{1.body}}) */
+  /** True if {{...}} IML expressions appear in scheme, authority, hostname, or port */
+  egressUrlHasDynamicHost?: boolean;
+  /** True if {{...}} IML expressions appear in URL path or query parameters */
+  egressUrlHasDynamicPathOrQuery?: boolean;
+  /** Module IDs referenced specifically inside the destination URL field */
+  urlReferencedNodeIds?: string[];
+  /** All upstream module IDs referenced anywhere in this node's config via {{id.*}} */
   referencedNodeIds: string[];
-  /** Nesting depth inside routers (0 = top-level flow) */
   branchDepth: number;
-  /** True if a conditional filter gates execution into this node */
   hasFilter: boolean;
 }
-
-export type EdgeKind = 'control_flow' | 'data_flow';
 
 export interface IREdge {
   from: string;
   to: string;
-  kind: EdgeKind;
-  /** Present on the first node of a router branch */
+  kind: 'control_flow' | 'data_flow';
   routeIndex?: number;
+  isErrorHandler?: boolean;
 }
 
 export interface WorkflowIR {
-  platform: Platform;
+  platform: WorkflowPlatform;
   name: string;
+  analysisStatus?: AnalysisStatus;
   nodes: Record<string, IRNode>;
   edges: IREdge[];
   entryNodeIds: string[];

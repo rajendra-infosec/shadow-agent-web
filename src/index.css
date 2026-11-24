@@ -461,3 +461,46 @@ body {
   justify-content: space-between;
   gap: 0.5rem;
 }
+.hidden-file-input {
+  display: none;
+}
+
+.path-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.partial-banner {
+  background: var(--med-bg);
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  color: #fde047;
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+
+.badge-REVIEW_REQUIRED {
+  background: var(--high-bg);
+  color: #fdba74;
+  border: 1px solid rgba(249, 115, 22, 0.45);
+}
+
+.badge-INCOMPLETE_ANALYSIS {
+  background: var(--med-bg);
+  color: #fde047;
+  border: 1px solid rgba(234, 179, 8, 0.45);
+}
+
+.badge-NO_CANDIDATES_FOUND {
+  background: var(--clean-bg);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.45);
+}
+
+.badge-LOW {
+  background: var(--accent-dim);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+}

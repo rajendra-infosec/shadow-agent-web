@@ -1,6 +1,6 @@
 import { useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { PARSER_LIMITS, parseMakeBlueprint } from './adapters/makeAdapter';
-import { analyzeWorkflow, type ScanReport } from './engine/taintEngine';
+import { analyzeWorkflow, type ScanReport, type ScanVerdict } from './engine/taintEngine';
 import { SAMPLE_BLUEPRINTS, type SampleBlueprint } from './samples/blueprints';
 
 function parseGatewayHosts(raw: string): string[] {
@@ -8,6 +8,12 @@ function parseGatewayHosts(raw: string): string[] {
     .split(',')
     .map((h) => h.trim().toLowerCase())
     .filter((h) => h.length > 0);
+}
+
+function formatVerdictLabel(verdict: ScanVerdict): string {
+  if (verdict === 'REVIEW_REQUIRED') return 'REVIEW REQUIRED';
+  if (verdict === 'INCOMPLETE_ANALYSIS') return 'INCOMPLETE ANALYSIS';
+  return 'NO CANDIDATES FOUND (SUPPORTED COVERAGE)';
 }
 
 export default function App() {
@@ -23,7 +29,7 @@ export default function App() {
   const executeScan = (jsonText: string, gatewaysText: string) => {
     const trimmed = jsonText.trim();
     if (!trimmed) {
-      setError('Paste a Make.com blueprint JSON or load one of the samples above.');
+      setError('Paste a Make.com blueprint JSON or load one of the synthetic samples above.');
       setReport(null);
       return;
     }
@@ -108,16 +114,19 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <h1>Shadow Agent</h1>
-          <p>Client-Side Make.com Blueprint Taint & AI Gateway Scanner</p>
+          <p>Client-Side Static Analyzer for Make.com Blueprints</p>
         </div>
-        <div className="csp-pill" title="Enforced in production via HTTP Content-Security-Policy header">
+        <div
+          className="csp-pill"
+          title="Strict CSP (default-src 'none'; connect-src 'none'; form-action 'none') blocks XHR/fetch/WebSocket/beacon/form egress; open-source client-side code."
+        >
           <span className="csp-dot" aria-hidden="true" />
-          CSP: connect-src 'none' • Zero Upload
+          Local Browser Analysis • Strict CSP
         </div>
       </header>
 
-      <section aria-label="One-click demo blueprints">
-        <div className="section-label">1-Click Demo Blueprints</div>
+      <section aria-label="One-click synthetic demo blueprints">
+        <div className="section-label">1-Click Synthetic Demo Blueprints</div>
         <div className="samples-grid">
           {SAMPLE_BLUEPRINTS.map((sample) => (
             <button
@@ -153,12 +162,12 @@ export default function App() {
           onDrop={handleDrop}
         >
           <strong>Drop a Make.com blueprint (.json) or click to browse</strong>
-          <span>Parsed 100% locally in browser memory — max 5 MB</span>
+          <span>Analyzed locally in browser memory — max 5 MB — no upload backend</span>
           <input
             ref={fileInputRef}
             type="file"
             accept=".json,application/json"
-            style={{ display: 'none' }}
+            className="hidden-file-input"
             onChange={handleFileChange}
           />
         </div>
@@ -199,7 +208,7 @@ export default function App() {
           </button>
           {report && (
             <button type="button" className="btn" onClick={handleExportReport}>
-              Export JSON Report
+              Export Redacted JSON Report
             </button>
           )}
         </div>
@@ -217,39 +226,60 @@ export default function App() {
             <div className="report-title-row">
               <h2>{report.workflowName}</h2>
               <span className={`badge badge-${report.summary.verdict}`}>
-                {report.summary.verdict} • RISK {report.summary.riskScore}/100
+                {formatVerdictLabel(report.summary.verdict)}
               </span>
             </div>
 
             <div className="stats-grid">
               <div className="stat-tile">
+                <div className="stat-value">{report.summary.analysisStatus}</div>
+                <div className="stat-label">Analysis Status</div>
+              </div>
+              <div className="stat-tile">
                 <div className="stat-value">{report.summary.totalNodes}</div>
                 <div className="stat-label">Modules Parsed</div>
               </div>
               <div className="stat-tile">
-                <div className="stat-value">{report.summary.criticalCount}</div>
-                <div className="stat-label">Critical</div>
-              </div>
-              <div className="stat-tile">
                 <div className="stat-value">{report.summary.highCount}</div>
-                <div className="stat-label">High</div>
+                <div className="stat-label">High Review</div>
               </div>
               <div className="stat-tile">
-                <div className="stat-value">{report.summary.gatewayBypassCount}</div>
-                <div className="stat-label">Gateway Bypasses</div>
+                <div className="stat-value">{report.summary.mediumCount}</div>
+                <div className="stat-label">Medium Review</div>
               </div>
               <div className="stat-tile">
-                <div className="stat-value">{report.summary.gatewayRoutedCount}</div>
-                <div className="stat-label">Gateway Routed</div>
+                <div className="stat-value">{report.summary.directOrNativeLlmCount}</div>
+                <div className="stat-label">Direct/Native LLM</div>
+              </div>
+              <div className="stat-tile">
+                <div className="stat-value">{report.summary.gatewayHostMatchedCount}</div>
+                <div className="stat-label">Gateway Host Matched</div>
               </div>
             </div>
           </div>
 
-          {report.findings.length === 0 ? (
-            <div className="clean-banner">
-              <strong>No Lethal Trifecta or AI Gateway bypasses detected.</strong> All inspected
-              LLM nodes and outbound sinks follow isolated or gateway-routed patterns.
+          {report.analysisStatus === 'PARTIAL' && (
+            <div className="partial-banner" role="status">
+              <strong>Partial Analysis:</strong> One or more parser safety limits or duplicate
+              module IDs were encountered. Some blueprint content was not inspected; see parser
+              warnings below.
             </div>
+          )}
+
+          {report.findings.length === 0 ? (
+            report.analysisStatus === 'PARTIAL' ? (
+              <div className="partial-banner">
+                <strong>No security conclusion available.</strong> Analysis was incomplete;
+                review the parser warnings below before trusting this blueprint.
+              </div>
+            ) : (
+              <div className="clean-banner">
+                <strong>No candidate pattern detected within supported coverage.</strong>{' '}
+                Unsupported modules, indirect variable stores (e.g. SetVariable/GetVariable),
+                runtime controls, and external permissions are not modeled statically. This is not
+                a security certification.
+              </div>
+            )
           ) : (
             <div className="findings-list">
               {report.findings.map((finding) => (
@@ -258,19 +288,21 @@ export default function App() {
                     <span className={`badge badge-${finding.severity}`}>{finding.severity}</span>
                     <span className="finding-rule">{finding.ruleId}</span>
                     <span className="finding-rule">
-                      • {finding.confidence.toUpperCase()}
+                      • {finding.evidenceBasis.replace(/_/g, ' ').toUpperCase()}
                     </span>
-                    {finding.mitigatedByGateway && (
-                      <span className="badge badge-CLEAN">GATEWAY ROUTED</span>
+                    {finding.gatewayEndpointMatched && (
+                      <span className="badge badge-NO_CANDIDATES_FOUND">
+                        GATEWAY HOST MATCHED (POLICY UNVERIFIED)
+                      </span>
                     )}
                   </div>
 
                   <h3 className="finding-title">{finding.title}</h3>
 
                   {finding.pathLabels.length > 0 && (
-                    <div className="taint-path" aria-label="Taint path">
+                    <div className="taint-path" aria-label="Observed graph path">
                       {finding.pathLabels.map((label, idx) => (
-                        <span key={`${finding.id}-${idx}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                        <span key={`${finding.id}-${idx}`} className="path-segment">
                           <span className="path-node">{label}</span>
                           {idx < finding.pathLabels.length - 1 && (
                             <span className="path-arrow" aria-hidden="true">
@@ -285,7 +317,7 @@ export default function App() {
                   <p className="finding-desc">{finding.description}</p>
 
                   <div className="finding-fix">
-                    <strong>Remediation:</strong> {finding.remediation}
+                    <strong>Recommended Review / Mitigation:</strong> {finding.remediation}
                   </div>
                 </article>
               ))}
@@ -306,8 +338,11 @@ export default function App() {
       )}
 
       <footer className="footer-note">
-        <span>Open-Source Static Taint Analyzer for Make.com Blueprints</span>
-        <span>Zero telemetry • Verify in DevTools Network tab</span>
+        <span>
+          Independent open-source research project (MIT). Evaluating n8n support & CLI/CI
+          integration — share sanitized use cases in GitHub Discussions.
+        </span>
+        <span>No upload endpoint or telemetry • Verify in DevTools Network tab</span>
       </footer>
     </main>
   );

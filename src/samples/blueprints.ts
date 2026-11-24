@@ -59,7 +59,7 @@ const VULNERABLE_CONTRACT_LEAK = {
 };
 
 const VULNERABLE_SSRF_DIRECT_HTTP = {
-  name: 'Webhook Enrichment + Dynamic Callback (SSRF & Direct API)',
+  name: 'Webhook Enrichment + Dynamic Host Callback (SSRF & Direct API)',
   flow: [
     {
       id: 1,
@@ -78,9 +78,9 @@ const VULNERABLE_SSRF_DIRECT_HTTP = {
     {
       id: 3,
       module: 'http:ActionSendData',
-      metadata: { designer: { name: 'Dynamic Callback Webhook' } },
+      metadata: { designer: { name: 'Dynamic Host Callback Webhook' } },
       mapper: {
-        url: 'https://hooks.partner-crm.example/ingest?tenant={{1.tenantSlug}}',
+        url: 'https://{{1.tenantHost}}/ingest?api_key=demo_secret_token',
         body: '{"summary":"{{2.data.choices[].message.content}}"}',
       },
     },
@@ -88,7 +88,7 @@ const VULNERABLE_SSRF_DIRECT_HTTP = {
 };
 
 const HARDENED_GATEWAY_WORKFLOW = {
-  name: 'Hardened Gateway Triage (Isolated Parallel Routes)',
+  name: 'Isolated Gateway Triage (Parallel Router Branches)',
   flow: [
     {
       id: 1,
@@ -105,7 +105,7 @@ const HARDENED_GATEWAY_WORKFLOW = {
             {
               id: 3,
               module: 'http:ActionSendData',
-              metadata: { designer: { name: 'Cloudflare AI Gateway (DLP Enforced)' } },
+              metadata: { designer: { name: 'Cloudflare AI Gateway Endpoint' } },
               mapper: {
                 url: 'https://gateway.ai.cloudflare.com/v1/democorp/prod-gw/openai/chat/completions',
                 body: '{"model":"gpt-4o-mini","response_format":{"type":"json_schema"},"messages":[{"role":"user","content":"Classify ticket ID only: {{1.ticketText}}"}]}',
@@ -144,21 +144,21 @@ export const SAMPLE_BLUEPRINTS: readonly SampleBlueprint[] = [
     id: 'vulnerable-contract-leak',
     label: 'Load $50K Leak PoC',
     badge: 'VULNERABLE',
-    description: 'Nested router + Native OpenAI bypass + Confirmed Lethal Trifecta via Gmail.',
+    description: 'Nested router + Native OpenAI connector + explicit Input → LLM → Gmail chain.',
     json: JSON.stringify(VULNERABLE_CONTRACT_LEAK, null, 2),
   },
   {
     id: 'vulnerable-ssrf-http',
     label: 'Load SSRF + Direct API',
     badge: 'VULNERABLE',
-    description: 'Direct HTTP call to api.openai.com + tainted dynamic callback URL.',
+    description: 'Direct HTTP call to api.openai.com + attacker-influenced destination hostname.',
     json: JSON.stringify(VULNERABLE_SSRF_DIRECT_HTTP, null, 2),
   },
   {
     id: 'hardened-gateway',
-    label: 'Load Hardened Sample',
+    label: 'Load Isolated Sample',
     badge: 'HARDENED',
-    description: 'AI Gateway routed + schema lock + isolated parallel route (zero false positives).',
+    description: 'Allowlisted AI Gateway host + schema step + isolated parallel route.',
     json: JSON.stringify(HARDENED_GATEWAY_WORKFLOW, null, 2),
   },
 ];
