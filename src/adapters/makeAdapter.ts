@@ -173,6 +173,7 @@ function extractImlRefsFromString(input: string, state: ParseState): string[] {
 
   let cursor = 0;
   let blocksScanned = 0;
+  const refRegex = /(?:^|[^A-Za-z0-9_$.])(\d+)\.[A-Za-z0-9_]/g;
 
   while (cursor < limit) {
     const openIdx = input.indexOf('{{', cursor);
@@ -188,17 +189,13 @@ function extractImlRefsFromString(input: string, state: ParseState): string[] {
     }
 
     const closeIdx = input.indexOf('}}', openIdx + 2);
-    if (closeIdx === -1 || closeIdx >= limit) {
-      cursor = openIdx + 2;
-      continue;
-    }
+    if (closeIdx === -1 || closeIdx >= limit) break;
 
-    const inner = input.slice(openIdx + 2, closeIdx).trim();
-    const dotIdx = inner.indexOf('.');
-    const candidateId = dotIdx === -1 ? inner : inner.slice(0, dotIdx).trim();
-
-    if (/^[a-zA-Z0-9_-]{1,64}$/.test(candidateId)) {
-      refs.add(candidateId);
+    const expr = input.slice(openIdx + 2, closeIdx);
+    refRegex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = refRegex.exec(expr)) !== null) {
+      refs.add(match[1]);
     }
 
     cursor = closeIdx + 2;
@@ -322,7 +319,9 @@ function inspectAndRedactUrl(rawUrl: string, state: ParseState): AnalyzedUrl {
   const rawRest = afterScheme.slice(authorityEnd);
 
   const allUrlRefs = extractImlRefsFromString(trimmed, state);
-  const hasDynamicHost = rawAuthority.includes('{{');
+  const atIdxEarly = rawAuthority.lastIndexOf('@');
+  const hostPortOnly = atIdxEarly !== -1 ? rawAuthority.slice(atIdxEarly + 1) : rawAuthority;
+  const hasDynamicHost = hostPortOnly.includes('{{');
   const hasDynamicPathOrQuery = rawRest.includes('{{');
 
   const atIdx = rawAuthority.lastIndexOf('@');
@@ -608,7 +607,6 @@ export function parseMakeBlueprint(
         {
           mapper: rawItem.mapper,
           parameters: rawItem.parameters,
-          filter: rawItem.filter,
         },
         state
       );

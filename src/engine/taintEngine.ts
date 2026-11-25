@@ -3,6 +3,7 @@ import type { AnalysisStatus, IRNode, WorkflowIR } from '../types/workflowIR';
 export const ENGINE_LIMITS = {
   MAX_FINDINGS: 200,
   MAX_BFS_VISITS: 5_000,
+  MAX_TOTAL_BFS_VISITS: 50_000,
 } as const;
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW';
@@ -68,6 +69,10 @@ interface BfsResult {
   limitHit: boolean;
 }
 
+interface AnalysisBudget {
+  remainingVisits: number;
+}
+
 const SEVERITY_ORDER: Record<Severity, number> = {
   HIGH: 0,
   MEDIUM: 1,
@@ -103,13 +108,15 @@ function buildAdjacency(
 
 /**
  * Cycle-safe, bounded shortest-path BFS from startId to targetId.
- * Signals limitHit=true if MAX_BFS_VISITS is exhausted before search completes.
+ * Enforces both per-traversal MAX_BFS_VISITS and global MAX_TOTAL_BFS_VISITS.
  */
 function findShortestPath(
   adj: Map<string, string[]>,
   startId: string,
-  targetId: string
+  targetId: string,
+  budget: AnalysisBudget
 ): BfsResult {
+  if (budget.remainingVisits <= 0) return { path: null, limitHit: true };
   if (startId === targetId) return { path: [startId], limitHit: false };
 
   const queue: string[] = [startId];
@@ -117,9 +124,10 @@ function findShortestPath(
 
   const visited = new Set<string>([startId]);
   const parent = new Map<string, string | null>([[startId, null]]);
+  budget.remainingVisits -= 1;
 
   while (head < queue.length) {
-    if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS) {
+    if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS || budget.remainingVisits <= 0) {
       return { path: null, limitHit: true };
     }
 
@@ -131,6 +139,7 @@ function findShortestPath(
       if (visited.has(next)) continue;
       visited.add(next);
       parent.set(next, current);
+      budget.remainingVisits -= 1;
 
       if (next === targetId) {
         const path: string[] = [];
@@ -142,7 +151,7 @@ function findShortestPath(
         return { path: path.reverse(), limitHit: false };
       }
 
-      if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS) {
+      if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS || budget.remainingVisits <= 0) {
         return { path: null, limitHit: true };
       }
 
@@ -162,9 +171,10 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
   let analysisStatus: AnalysisStatus = ir.analysisStatus ?? 'COMPLETE';
   const warnings: string[] = [...ir.parseWarnings];
   let bfsLimitHit = false;
+  const budget: AnalysisBudget = { remainingVisits: ENGINE_LIMITS.MAX_TOTAL_BFS_VISITS };
 
   const runBfs = (adj: Map<string, string[]>, startId: string, targetId: string): string[] | null => {
-    const res = findShortestPath(adj, startId, targetId);
+    const res = findShortestPath(adj, startId, targetId, budget);
     if (res.limitHit) bfsLimitHit = true;
     return res.path;
   };
@@ -190,7 +200,9 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
 
   // Rule 1: CANDIDATE TRIFECTA CHAIN (Input Source -> LLM Processor -> Outbound Sink)
   trifectaLoop: for (const source of sources) {
+    if (bfsLimitHit) break;
     for (const llm of llms) {
+      if (bfsLimitHit) break trifectaLoop;
       if (source.id === llm.id) continue;
 
       const srcToLlmData = runBfs(dataAdj, source.id, llm.id);
@@ -198,6 +210,7 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
       if (!srcToLlmAny) continue;
 
       for (const sink of sinks) {
+        if (bfsLimitHit) break trifectaLoop;
         if (sink.id === llm.id || sink.id === source.id) continue;
 
         const llmToSinkData = runBfs(dataAdj, llm.id, sink.id);
@@ -211,14 +224,14 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
         const ok = pushFinding({
           id: `CHAIN-${source.id}-${llm.id}-${sink.id}`,
           ruleId: 'CANDIDATE_TRIFECTA_CHAIN',
-          severity: hasExplicitMapping ? 'HIGH' : 'MEDIUM',
+          severity: hasExplicitMapping ? 'HIGH' : 'LOW',
           evidenceBasis: hasExplicitMapping ? 'explicit_mapping' : 'control_flow_only',
           title: hasExplicitMapping
             ? 'Explicit Mapping Chain Observed: Input → LLM → Outbound Sink'
-            : 'Candidate Control-Flow Path: Input → LLM → Outbound Sink',
+            : 'Control-Flow Adjacent Path (Unverified Data Link): Input → LLM → Outbound Sink',
           description: hasExplicitMapping
             ? `Explicit IML mapping references connect ${source.label} into LLM node ${llm.label} and from ${llm.label} into outbound sink ${sink.label}. Static analysis cannot verify whether private data is present in context or whether runtime filters block abuse; manual review is required.`
-            : `Control-flow execution reaches ${llm.label} from ${source.label} and continues to outbound sink ${sink.label} without an explicit IML reference on both legs. Verify whether untrusted input enters the prompt or LLM output triggers this egress action.`,
+            : `Control-flow execution reaches ${llm.label} from ${source.label} and continues to outbound sink ${sink.label} without an explicit IML reference on both legs. Verify whether untrusted input enters the prompt or LLM output triggers this egress action (e.g., via SetVariable or Data Store).`,
           remediation:
             'Review data sensitivity and trust boundaries: (1) enforce strict JSON schema / allowlisted enum validation after the LLM, (2) require human approval before sensitive outbound actions, and (3) verify whether prompt-injection and DLP controls are enforced upstream.',
           pathNodeIds,
@@ -270,11 +283,13 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
   // Rule 4: TAINTED DYNAMIC HOST (Potential SSRF / Destination Host Manipulation)
   const taintOrigins = [...sources, ...llms];
   ssrfLoop: for (const sink of sinks) {
+    if (bfsLimitHit) break;
     if (!sink.rawType.toLowerCase().startsWith('http:')) continue;
     if (!sink.egressUrlHasDynamicHost) continue;
 
     const urlRefs = sink.urlReferencedNodeIds ?? [];
     for (const origin of taintOrigins) {
+      if (bfsLimitHit) break ssrfLoop;
       if (origin.id === sink.id) continue;
 
       let matchedPath: string[] | null = null;
@@ -287,6 +302,7 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
             matchedPath = [...upstreamPath, sink.id];
             break;
           }
+          if (bfsLimitHit) break ssrfLoop;
         }
       }
 
@@ -315,7 +331,7 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     analysisStatus = 'PARTIAL';
     if (bfsLimitHit) {
       warnings.push(
-        `Graph traversal hit the ${ENGINE_LIMITS.MAX_BFS_VISITS}-node BFS visit limit; some paths may not have been inspected.`
+        `Graph traversal hit the ${ENGINE_LIMITS.MAX_TOTAL_BFS_VISITS.toLocaleString()}-visit global analysis budget; some paths may not have been inspected.`
       );
     }
     if (truncatedFindings) {

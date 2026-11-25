@@ -188,4 +188,44 @@ describe('taintEngine static analyzer', () => {
       expect(serialized).not.toContain(canary);
     }
   });
+  it('extracts module refs wrapped inside IML functions (e.g., trim, lower, replace)', () => {
+    const ir = parseMakeBlueprint({
+      name: 'Wrapped IML Functions',
+      flow: [
+        { id: 1, module: 'gateway:CustomWebHook' },
+        { id: 2, module: 'openai-gpt-3:CreateCompletion', mapper: { prompt: '{{trim(1.body)}}' } },
+        { id: 3, module: 'http:ActionSendData', mapper: { url: 'https://{{lower(1.host)}}/exfil', data: '{{replace(2.result; "a"; "b")}}' } },
+      ],
+    });
+    const report = analyzeWorkflow(ir);
+    expect(report.findings.some((f) => f.ruleId === 'CANDIDATE_TRIFECTA_CHAIN' && f.severity === 'HIGH')).toBe(true);
+    expect(report.findings.some((f) => f.ruleId === 'TAINTED_DYNAMIC_HOST' && f.severity === 'HIGH')).toBe(true);
+  });
+
+  it('does NOT promote filter-only references to HIGH explicit data-flow chains', () => {
+    const ir = parseMakeBlueprint({
+      name: 'Filter Only Reference',
+      flow: [
+        { id: 1, module: 'gateway:CustomWebHook' },
+        { id: 2, module: 'openai-gpt-3:CreateCompletion', filter: { conditions: [[{ a: '{{1.flag}}', b: 'yes' }]] }, mapper: { prompt: 'Static prompt' } },
+        { id: 3, module: 'http:ActionSendData', filter: { conditions: [[{ a: '{{2.status}}', b: 'ok' }]] }, mapper: { url: 'https://example.com/notify', data: 'Static alert' } },
+      ],
+    });
+    const report = analyzeWorkflow(ir);
+    const chain = report.findings.find((f) => f.ruleId === 'CANDIDATE_TRIFECTA_CHAIN');
+    expect(chain?.severity).toBe('LOW');
+    expect(chain?.evidenceBasis).toBe('control_flow_only');
+  });
+
+  it('does NOT flag dynamic URL userinfo@ on a fixed hostname as TAINTED_DYNAMIC_HOST', () => {
+    const ir = parseMakeBlueprint({
+      name: 'Dynamic Userinfo Fixed Host',
+      flow: [
+        { id: 1, module: 'gateway:CustomWebHook' },
+        { id: 2, module: 'http:ActionSendData', mapper: { url: 'https://{{1.username}}@fixed.example.com/callback' } },
+      ],
+    });
+    const report = analyzeWorkflow(ir);
+    expect(report.findings.some((f) => f.ruleId === 'TAINTED_DYNAMIC_HOST')).toBe(false);
+  });
 });
