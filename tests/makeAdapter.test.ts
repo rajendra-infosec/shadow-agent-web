@@ -228,4 +228,94 @@ describe('taintEngine static analyzer', () => {
     const report = analyzeWorkflow(ir);
     expect(report.findings.some((f) => f.ruleId === 'TAINTED_DYNAMIC_HOST')).toBe(false);
   });
+  it('ignores reference-shaped text inside quoted IML string literals (including escaped quotes)', () => {
+    const ir = parseMakeBlueprint({
+      name: 'Quoted IML Literals',
+      flow: [
+        { id: 1, module: 'gateway:CustomWebHook' },
+        { id: 2, module: 'openai-gpt-3:CreateCompletion', mapper: { prompt: 'static' } },
+        {
+          id: 3,
+          module: 'http:ActionSendData',
+          mapper: {
+            url: 'https://example.com/hook',
+            data: '{{replace(1.body; "literal 2.body \\"2.secret\\""; \'2.other\')}}',
+          },
+        },
+      ],
+    });
+    expect(ir.nodes['3'].referencedNodeIds).toContain('1');
+    expect(ir.nodes['3'].referencedNodeIds).not.toContain('2');
+  });
+
+  it('fails closed to INCOMPLETE_ANALYSIS when global MAX_TOTAL_BFS_VISITS budget is exhausted', () => {
+    const nodes: Record<string, any> = {};
+    const edges: any[] = [];
+
+    // 100-node unreachable chain
+    for (let i = 0; i < 100; i++) {
+      const id = `c${i}`;
+      nodes[id] = {
+        id,
+        platform: 'make',
+        rawType: 'util:SetVariable',
+        label: `Chain ${i}`,
+        roles: ['neutral'],
+        ai: { isLLM: false, gatewayStatus: 'none' },
+        referencedNodeIds: [],
+        branchDepth: 0,
+        hasFilter: false,
+      };
+      if (i > 0) {
+        edges.push({ from: `c${i - 1}`, to: id, kind: 'control_flow', isErrorHandler: false });
+      }
+    }
+
+    // 100 untrusted sources feeding into the 100-node chain
+    for (let i = 0; i < 100; i++) {
+      const id = `s${i}`;
+      nodes[id] = {
+        id,
+        platform: 'make',
+        rawType: 'gateway:CustomWebHook',
+        label: `Source ${i}`,
+        roles: ['untrusted_source'],
+        ai: { isLLM: false, gatewayStatus: 'none' },
+        referencedNodeIds: [],
+        branchDepth: 0,
+        hasFilter: false,
+      };
+      edges.push({ from: id, to: 'c0', kind: 'control_flow', isErrorHandler: false });
+    }
+
+    // 10 disconnected gateway-routed LLMs (100 * 10 * ~101 visits > 50,000 global budget, 0 findings)
+    for (let i = 0; i < 10; i++) {
+      const id = `l${i}`;
+      nodes[id] = {
+        id,
+        platform: 'make',
+        rawType: 'http:ActionSendData',
+        label: `LLM ${i}`,
+        roles: ['llm_processor'],
+        ai: { isLLM: true, provider: 'openai', gatewayStatus: 'gateway_routed' },
+        referencedNodeIds: [],
+        branchDepth: 0,
+        hasFilter: false,
+      };
+    }
+
+    const report = analyzeWorkflow({
+      platform: 'make',
+      name: 'Global BFS Budget Exhaustion',
+      analysisStatus: 'COMPLETE',
+      nodes,
+      edges,
+      entryNodeIds: ['s0'],
+      parseWarnings: [],
+    });
+
+    expect(report.analysisStatus).toBe('PARTIAL');
+    expect(report.summary.verdict).toBe('INCOMPLETE_ANALYSIS');
+    expect(report.summary.verdict).not.toBe('NO_CANDIDATES_FOUND');
+  });
 });

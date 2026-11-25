@@ -23,7 +23,7 @@ Shadow Agent reports **static graph evidence**, not confirmed runtime exploitabi
 
 ### Verdict States
 - **`REVIEW_REQUIRED`**: One or more candidate findings were observed and require manual trust-boundary review.
-- **`INCOMPLETE_ANALYSIS`**: Parser or graph traversal hit a safety ceiling (50k-char string scan, 500 IML blocks, 40-level object depth, 2,000 modules, 5,000 BFS visits, or duplicate module IDs). Fails closed—never reports a clean verdict when truncated.
+- **`INCOMPLETE_ANALYSIS`**: Parser or graph traversal hit a safety ceiling (50k-char string scan, 500 IML blocks, 40-level object depth, 2,000 modules, 5,000 per-traversal / 50,000 global BFS visits, or duplicate module IDs). Fails closed—never reports a clean verdict when truncated.
 - **`NO_CANDIDATES_FOUND`**: Zero findings within supported static coverage. **This is not a security certification.**
 
 ---
@@ -68,7 +68,7 @@ Static blueprint analysis cannot observe runtime state. Shadow Agent does **not*
 
 ~~~bash
 npm ci
-npm test        # 15 Vitest unit, redaction canary & adversarial DoS tests
+npm test        # 20 Vitest unit, redaction canary & adversarial DoS tests
 npm run build   # TypeScript check + Vite production bundle (dist/)
 ~~~
 

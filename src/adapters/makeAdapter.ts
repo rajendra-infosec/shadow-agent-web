@@ -160,6 +160,35 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * Linear-time O(n) IML reference extractor (`{{12.body}}`, `{{3.choices[].text}}`).
  * Bounded against ReDoS and pathological brace bombs; flags PARTIAL if truncated.
  */
+function stripQuotedStrings(expr: string): string {
+  let out = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === quote) {
+        quote = null;
+        out += ' ';
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ' ';
+      continue;
+    }
+    out += ch;
+  }
+
+  return out;
+}
+
 function extractImlRefsFromString(input: string, state: ParseState): string[] {
   const refs = new Set<string>();
   let limit = input.length;
@@ -191,7 +220,7 @@ function extractImlRefsFromString(input: string, state: ParseState): string[] {
     const closeIdx = input.indexOf('}}', openIdx + 2);
     if (closeIdx === -1 || closeIdx >= limit) break;
 
-    const expr = input.slice(openIdx + 2, closeIdx);
+    const expr = stripQuotedStrings(input.slice(openIdx + 2, closeIdx));
     refRegex.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = refRegex.exec(expr)) !== null) {
