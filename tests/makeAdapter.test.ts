@@ -167,4 +167,25 @@ describe('taintEngine static analyzer', () => {
     const report = analyzeWorkflow(ir);
     expect(report.findings.some((f) => f.ruleId === 'CANDIDATE_TRIFECTA_CHAIN')).toBe(true);
   });
+  it("redacts path-embedded webhook secrets (Slack, Discord, Telegram, Make) via canary check", () => {
+    const canaries = [
+      "CANARY_SLACK_SECRET_999",
+      "CANARY_DISCORD_TOKEN_888",
+      "987654321:CANARY_TG_BOT_777",
+      "canarymaketoken1234567890abcdef",
+    ];
+    const ir = parseMakeBlueprint({
+      name: "Webhook Path Canary",
+      flow: [
+        { id: 1, module: "http:ActionSendData", mapper: { url: "https://hooks.slack.com/services/T000/B000/CANARY_SLACK_SECRET_999" } },
+        { id: 2, module: "http:ActionSendData", mapper: { url: "https://discord.com/api/webhooks/12345/CANARY_DISCORD_TOKEN_888" } },
+        { id: 3, module: "http:ActionSendData", mapper: { url: "https://api.telegram.org/bot987654321:CANARY_TG_BOT_777/sendMessage" } },
+        { id: 4, module: "http:ActionSendData", mapper: { url: "https://hook.eu1.make.com/canarymaketoken1234567890abcdef" } },
+      ],
+    });
+    const serialized = JSON.stringify(ir);
+    for (const canary of canaries) {
+      expect(serialized).not.toContain(canary);
+    }
+  });
 });

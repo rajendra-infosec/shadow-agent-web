@@ -1,3 +1,22 @@
+function redactSensitivePath(pathname: string): string {
+  if (!pathname || pathname === '/') return pathname;
+  const p = pathname
+    .replace(/\/services\/[^/?#]+(?:\/[^/?#]+)*/gi, '/services/[REDACTED]')
+    .replace(/\/api\/webhooks\/[^/?#]+(?:\/[^/?#]+)*/gi, '/api/webhooks/[REDACTED]')
+    .replace(/\/bot[0-9]{5,}:[A-Za-z0-9_-]+/gi, '/bot[REDACTED]');
+
+  return p
+    .split('/')
+    .map((seg) => {
+      if (!seg || seg.includes('{{') || seg.startsWith('[REDACTED')) return seg;
+      if (seg.length >= 20 && /^[A-Za-z0-9_.:-]+$/.test(seg)) {
+        return '[REDACTED_TOKEN]';
+      }
+      return seg;
+    })
+    .join('/');
+}
+
 import type {
   AINodeMetadata,
   AnalysisStatus,
@@ -322,7 +341,7 @@ function inspectAndRedactUrl(rawUrl: string, state: ParseState): AnalyzedUrl {
       pathOnly = rawRest.slice(0, hashIdx);
     }
 
-    const redactedUrl = `${protocol}//${cleanAuthority}${pathOnly}${hasQuery ? '?[REDACTED]' : ''}`;
+    const redactedUrl = `${protocol}//${cleanAuthority}${redactSensitivePath(pathOnly)}${hasQuery ? '?[REDACTED]' : ''}`;
     return {
       validHttp: true,
       redactedUrl,
@@ -350,7 +369,7 @@ function inspectAndRedactUrl(rawUrl: string, state: ParseState): AnalyzedUrl {
     });
 
     const querySuffix = redactedParams.length > 0 ? `?${redactedParams.join('&')}` : '';
-    const redactedUrl = `${parsed.protocol}//${parsed.host}${parsed.pathname}${querySuffix}`;
+    const redactedUrl = `${parsed.protocol}//${parsed.host}${redactSensitivePath(parsed.pathname)}${querySuffix}`;
 
     return {
       validHttp: true,

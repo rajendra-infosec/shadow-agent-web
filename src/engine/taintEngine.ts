@@ -63,6 +63,11 @@ export interface ScanReport {
   parseWarnings: string[];
 }
 
+interface BfsResult {
+  path: string[] | null;
+  limitHit: boolean;
+}
+
 const SEVERITY_ORDER: Record<Severity, number> = {
   HIGH: 0,
   MEDIUM: 1,
@@ -98,14 +103,14 @@ function buildAdjacency(
 
 /**
  * Cycle-safe, bounded shortest-path BFS from startId to targetId.
- * Returns the ordered array of node IDs [startId, ..., targetId], or null if unreachable.
+ * Signals limitHit=true if MAX_BFS_VISITS is exhausted before search completes.
  */
 function findShortestPath(
   adj: Map<string, string[]>,
   startId: string,
   targetId: string
-): string[] | null {
-  if (startId === targetId) return [startId];
+): BfsResult {
+  if (startId === targetId) return { path: [startId], limitHit: false };
 
   const queue: string[] = [startId];
   let head = 0;
@@ -113,7 +118,11 @@ function findShortestPath(
   const visited = new Set<string>([startId]);
   const parent = new Map<string, string | null>([[startId, null]]);
 
-  while (head < queue.length && visited.size <= ENGINE_LIMITS.MAX_BFS_VISITS) {
+  while (head < queue.length) {
+    if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS) {
+      return { path: null, limitHit: true };
+    }
+
     const current = queue[head++];
     const neighbors = adj.get(current);
     if (!neighbors) continue;
@@ -130,14 +139,18 @@ function findShortestPath(
           path.push(cursor);
           cursor = parent.get(cursor);
         }
-        return path.reverse();
+        return { path: path.reverse(), limitHit: false };
+      }
+
+      if (visited.size >= ENGINE_LIMITS.MAX_BFS_VISITS) {
+        return { path: null, limitHit: true };
       }
 
       queue.push(next);
     }
   }
 
-  return null;
+  return { path: null, limitHit: false };
 }
 
 function labelsForPath(ir: WorkflowIR, ids: string[]): string[] {
@@ -146,7 +159,15 @@ function labelsForPath(ir: WorkflowIR, ids: string[]): string[] {
 
 export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
   const allNodes: IRNode[] = Object.values(ir.nodes);
-  const analysisStatus: AnalysisStatus = ir.analysisStatus ?? 'COMPLETE';
+  let analysisStatus: AnalysisStatus = ir.analysisStatus ?? 'COMPLETE';
+  const warnings: string[] = [...ir.parseWarnings];
+  let bfsLimitHit = false;
+
+  const runBfs = (adj: Map<string, string[]>, startId: string, targetId: string): string[] | null => {
+    const res = findShortestPath(adj, startId, targetId);
+    if (res.limitHit) bfsLimitHit = true;
+    return res.path;
+  };
 
   const sources = allNodes.filter((n) => n.roles.includes('untrusted_source'));
   const llms = allNodes.filter((n) => n.roles.includes('llm_processor'));
@@ -172,15 +193,15 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     for (const llm of llms) {
       if (source.id === llm.id) continue;
 
-      const srcToLlmData = findShortestPath(dataAdj, source.id, llm.id);
-      const srcToLlmAny = srcToLlmData ?? findShortestPath(combinedAdj, source.id, llm.id);
+      const srcToLlmData = runBfs(dataAdj, source.id, llm.id);
+      const srcToLlmAny = srcToLlmData ?? runBfs(combinedAdj, source.id, llm.id);
       if (!srcToLlmAny) continue;
 
       for (const sink of sinks) {
         if (sink.id === llm.id || sink.id === source.id) continue;
 
-        const llmToSinkData = findShortestPath(dataAdj, llm.id, sink.id);
-        const llmToSinkAny = llmToSinkData ?? findShortestPath(combinedAdj, llm.id, sink.id);
+        const llmToSinkData = runBfs(dataAdj, llm.id, sink.id);
+        const llmToSinkAny = llmToSinkData ?? runBfs(combinedAdj, llm.id, sink.id);
         if (!llmToSinkAny) continue;
 
         const hasExplicitMapping = Boolean(srcToLlmData && llmToSinkData);
@@ -247,7 +268,6 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
   }
 
   // Rule 4: TAINTED DYNAMIC HOST (Potential SSRF / Destination Host Manipulation)
-  // Only fires when {{...}} appears in the URL scheme, authority, hostname, or port — NOT fixed-host query params.
   const taintOrigins = [...sources, ...llms];
   ssrfLoop: for (const sink of sinks) {
     if (!sink.rawType.toLowerCase().startsWith('http:')) continue;
@@ -262,7 +282,7 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
         matchedPath = [origin.id, sink.id];
       } else {
         for (const urlRefId of urlRefs) {
-          const upstreamPath = findShortestPath(dataAdj, origin.id, urlRefId);
+          const upstreamPath = runBfs(dataAdj, origin.id, urlRefId);
           if (upstreamPath) {
             matchedPath = [...upstreamPath, sink.id];
             break;
@@ -291,7 +311,20 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
     }
   }
 
-  // Deterministic ordering: HIGH -> MEDIUM -> LOW, then by ID
+  if (bfsLimitHit || truncatedFindings) {
+    analysisStatus = 'PARTIAL';
+    if (bfsLimitHit) {
+      warnings.push(
+        `Graph traversal hit the ${ENGINE_LIMITS.MAX_BFS_VISITS}-node BFS visit limit; some paths may not have been inspected.`
+      );
+    }
+    if (truncatedFindings) {
+      warnings.push(
+        `Finding count reached the ${ENGINE_LIMITS.MAX_FINDINGS}-finding safety cap; additional findings were omitted.`
+      );
+    }
+  }
+
   findings.sort((a, b) => {
     const sevDiff = SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
     if (sevDiff !== 0) return sevDiff;
@@ -332,6 +365,6 @@ export function analyzeWorkflow(ir: WorkflowIR): ScanReport {
       lowCount: findings.filter((f) => f.severity === 'LOW').length,
       truncatedFindings,
     },
-    parseWarnings: ir.parseWarnings,
+    parseWarnings: warnings,
   };
 }
